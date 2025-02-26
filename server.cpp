@@ -31,7 +31,8 @@ static int32_t read_full(int fd, char *buf, size_t n) {
 		errno = 0;
         ssize_t rv = read(fd, buf, n);
         if (rv <= 0) {
-			if (errno == EINTR) {
+			if (errno == EINTR) { // interrupted by signal, not an error
+				clog << "interrupted by signal" << endl;
 				continue;
 			}
             return -1;  // error, or unexpected EOF
