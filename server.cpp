@@ -59,74 +59,7 @@ static void buf_consume(std::vector<uint8_t> &buf, size_t n) {
 	buf.erase(buf.begin(), buf.begin() + n);
 }
 
-static int32_t read_full(int fd, char *buf, size_t n) {
-	while (n > 0) {
-		errno = 0;
-		ssize_t rv = read(fd, buf, n);
-		if (rv <= 0) {
-			if (errno == EINTR) { // interrupted by signal, not an error
-				std::clog << "interrupted by signal" << std::endl;
-				continue;
-			}
-			return -1;  // error, or unexpected EOF
-		}
-		assert((size_t)rv <= n);
-		n -= (size_t)rv;
-		buf += rv;
-	}
-	return 0;
-}
 
-static int32_t write_all(int fd, const char *buf, size_t n) {
-	while (n > 0) {
-		ssize_t rv = write(fd, buf, n);
-		if (rv <= 0) {
-			return -1;  // error
-		}
-		assert((size_t)rv <= n);
-		n -= (size_t)rv;
-		buf += rv;
-	}
-	return 0;
-}
-
-static int32_t one_request(int connfd) {
-	// 4 bytes header
-	char rbuf[4 + k_max_msg];
-	// set errno to 0 before calling read_full
-	errno = 0;
-	int32_t err = read_full(connfd, rbuf, 4);
-	if (err) {
-		msg(errno == 0 ? "EOF" : "read() error");
-		return err;
-	}
-
-
-	uint32_t len = 0;
-	memcpy(&len, rbuf, 4);  // assume little endian
-	if (len > k_max_msg) {
-		msg("too long");
-		cout << "len: " << len << endl;
-		cout << rbuf << endl;
-		return -1;
-	}
-
-	// request body
-	err = read_full(connfd, &rbuf[4], len);
-	if (err) {
-		msg("read() error");
-		return err;
-	}
-	// do something
-	printf("client says: %.*s\n", len, &rbuf[4]);
-	// reply using the same protocol
-	const char reply[] = "world";
-	char wbuf[4 + sizeof(reply)];
-	len = (uint32_t)strlen(reply);
-	memcpy(wbuf, &len, 4);
-	memcpy(&wbuf[4], reply, len);
-	return write_all(connfd, wbuf, 4 + len);
-}
 
 // Handle accept.
 static Conn *handle_accept(int listen_fd) {
@@ -158,10 +91,12 @@ static bool try_one_request(Conn *conn) {
 	uint32_t len = 0; // Message length.
 	memcpy(&len, conn->incoming.data(), 4); // Assume little endian.
 	if (len > k_max_msg) { // protocol violation
+		msg("too long");
 		conn->want_close = true;
 		return false; // return with want_close = true
 	}
 
+	
 	if(4 + len > conn->incoming.size()) {
 		return false;
 	}
@@ -180,6 +115,32 @@ static bool try_one_request(Conn *conn) {
 	return true;
 }
 
+// Handle write.
+static void handle_write(Conn *conn) {
+	assert(conn->outgoing.size() > 0);
+
+	// Write the response to the client.
+	ssize_t rv = write(conn->fd, conn->outgoing.data(), conn->outgoing.size());
+
+	if (rv < 0 && errno == EAGAIN) {
+		return; // actually not ready
+	}
+
+	if (rv <= 0) {
+		conn->want_close = true;
+		return; // return with want_close
+	}
+
+	// Remove the sent data from the `Conn::outgoing` buffer.
+	buf_consume(conn->outgoing, (size_t)rv);
+
+	// If there is no more data to send, set the `want_read` flag.
+	if (conn->outgoing.size() == 0) {
+		conn->want_read = true;
+		conn->want_write = false;
+	} // else, keep `want_write` true
+}
+
 // Handle read.
 static void handle_read(Conn *conn) {
 	uint8_t buf[64 * 1024]; // 64 KB buffer
@@ -192,34 +153,19 @@ static void handle_read(Conn *conn) {
 	// Append the read data to the `Conn::incoming` buffer.
 	buf_append(conn->incoming, buf, (size_t)rv);
 
-	try_one_request(conn);
+	while (try_one_request(conn)) {
+		// Process as many requests as possible.
+	}
 
 	// If there is data to send, set the `want_write` flag.
 	if (conn->outgoing.size() > 0) {
 		conn->want_read = false;
 		conn->want_write = true;
+
+		// The client is likely ready for writing, so we can try to write immediately.
+		// This is an optimization to avoid waiting for the next event loop iteration.
+		return handle_write(conn);
 	} // else, keep `want_read` true
-}
-
-// Handle write.
-static void handle_write(Conn *conn) {
-	assert(conn->outgoing.size() > 0);
-
-	// Write the response to the client.
-	ssize_t rv = write(conn->fd, conn->outgoing.data(), conn->outgoing.size());
-	if (rv <= 0) {
-		conn->want_close = true;
-		return; // return with want_close = true
-	}
-
-	// Remove the sent data from the `Conn::outgoing` buffer.
-	buf_consume(conn->outgoing, (size_t)rv);
-
-	// If there is no more data to send, set the `want_read` flag.
-	if (conn->outgoing.size() == 0) {
-		conn->want_read = true;
-		conn->want_write = false;
-	} // else, keep `want_write` true
 }
 
 // Main function.
@@ -327,29 +273,14 @@ int main()
 
 			// Handle error or close.
 			if ((revents & POLLERR) || conn->want_close) {
-				close(conn->fd);
+				if (close(conn->fd) < 0) {
+					die("close");
+				}
 				delete conn;
 				fd2conn[poll_args[i].fd] = nullptr;
 			}
 		}
 
-		// // Accept connection.
-		// struct sockaddr_in client_addr = {};
-		// socklen_t client_addr_len = sizeof(client_addr);
-		// int client_fd = accept(listen_fd, (struct sockaddr *)&client_addr, &client_addr_len);
 
-		// if (client_fd < 0) {
-		// 	continue; // error
-		// }
-
-		// while (true) {
-		// 	int32_t err = one_request(client_fd);
-		// 	if (err) {
-		//         break;
-		//     }
-		// }
-
-		// // Close the client connection.
-		// close(client_fd);
 	}
 }
