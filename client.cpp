@@ -106,18 +106,29 @@ int main() {
         die("connect");
     }
 
-    int32_t err = query(fd, "hello1");
-    if (err) {
-        goto L_DONE;
+    const char *messages[] = {"I can write", "I am a client", "This is a test"};
+    messages[3] = (const char *)malloc(k_max_msg-1);
+    // memset((void *)messages[3], 'a', k_max_msg -1);
+
+    for (const char *msg : messages) {
+        int32_t err = query(fd, msg);
+        if (err) {
+            goto L_DONE;
+        }
     }
-    err = query(fd, "hello2");
-    if (err) {
-        goto L_DONE;
-    }
-    err = query(fd, "hello3");
-    if (err) {
-        goto L_DONE;
-    }
+
+    // int32_t err = query(fd, "hello1");
+    // if (err) {
+    //     goto L_DONE;
+    // }
+    // err = query(fd, "hello2");
+    // if (err) {
+    //     goto L_DONE;
+    // }
+    // err = query(fd, "hello3");
+    // if (err) {
+    //     goto L_DONE;
+    // }
 
 L_DONE:
     close(fd);
